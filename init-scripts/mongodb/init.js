@@ -6,5 +6,4 @@ db.createUser({
     roles: [{ role: "readWrite", db: "knowledge_hub" }],
 })
 
-db.createCollection('kh_document');
-db.createCollection('kh_chunk');
+db.createCollection('document_content');
