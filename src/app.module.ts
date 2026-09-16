@@ -7,6 +7,8 @@ import { ConfigModule,ConfigService } from '@nestjs/config';
 import { MongooseModule } from '@nestjs/mongoose';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { DocumentEntity } from './document/entities/document.entity.js';
+import { StorageModule } from './storage/storage.module';
+
 
 export const { ObserveModule, ObserveInstrument } = createObserveModule();
 
@@ -15,6 +17,7 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
     ConfigModule.forRoot({
       isGlobal: true,
     }),
+    StorageModule,
     TypeOrmModule.forRootAsync({
       inject:[ConfigService],
       useFactory: (config: ConfigService) => ({
