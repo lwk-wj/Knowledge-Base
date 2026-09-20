@@ -1,3 +1,5 @@
 allowBuilds:
   core-js: true
   tesseract.js: set this to true or false
+minimumReleaseAgeExclude:
+  - yargs@18.2.0

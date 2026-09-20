@@ -1,6 +1,6 @@
-import snowflakeModule from 'snowflake-id';
-
-const SnowflakeId = snowflakeModule.default;
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const rawSnowflake = require('snowflake-id');
+const SnowflakeId = rawSnowflake.default || rawSnowflake;
 
 const snowflake = new SnowflakeId({
   mid: Number(process.env.SNOWFLAKE_WORKER_ID ?? 1),

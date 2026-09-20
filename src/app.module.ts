@@ -1,25 +1,19 @@
 import { Module } from '@nestjs/common';
-import { createObserveModule } from '@nestjs/observe';
-import { AppController } from './app.controller.js';
-import { AppService } from './app.service.js';
-import { DocumentModule } from './document/document.module.js';
-import { ConfigModule,ConfigService } from '@nestjs/config';
-import { MongooseModule } from '@nestjs/mongoose';
+import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { DocumentEntity } from './document/entities/document.entity.js';
+import { MongooseModule } from '@nestjs/mongoose';
+import { AppController } from './app.controller';
+import { AppService } from './app.service';
+import { DocumentModule } from './document/document.module';
+import { DocumentEntity } from './document/entities/document.entity';
 import { StorageModule } from './storage/storage.module';
-
-
-export const { ObserveModule, ObserveInstrument } = createObserveModule();
 
 @Module({
   imports: [
-    ConfigModule.forRoot({
-      isGlobal: true,
-    }),
+    ConfigModule.forRoot({ isGlobal: true }),
     StorageModule,
     TypeOrmModule.forRootAsync({
-      inject:[ConfigService],
+      inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
         type: 'postgres' as const,
         host: config.get<string>('POSTGRES_HOST', 'localhost'),
@@ -32,8 +26,8 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
       }),
     }),
     MongooseModule.forRootAsync({
-       inject: [ConfigService],
-       useFactory: (config: ConfigService) => ({
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
         uri: config.get<string>(
           'MONGO_URI',
           'mongodb://mongo_user:mongo_pass123@localhost:27017/knowledge_hub?authSource=admin',
