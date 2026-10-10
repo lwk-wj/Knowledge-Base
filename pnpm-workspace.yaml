@@ -1,5 +1,9 @@
 allowBuilds:
   core-js: true
-  tesseract.js: set this to true or false
+  tesseract.js: true
 minimumReleaseAgeExclude:
   - yargs@18.2.0
+overrides:
+  ora: "5.4.1"
+  "@angular-devkit/schematics>ora": "5.4.1"
+
