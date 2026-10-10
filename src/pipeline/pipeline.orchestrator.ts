@@ -1,187 +1,74 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { InjectEntityManager } from '@nestjs/typeorm';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
-import { EntityManager } from 'typeorm';
-import { DocumentEntity } from '../document/entities/document.entity';
+import { ConsumeMessage } from 'amqplib';
+import { PipelineOrchestrator } from '../pipeline/pipeline.orchestrator';
 import {
-  DocumentContent,
-  DocumentContentDocument,
-} from '../document/schemas/document-content.schema';
-import { ChunkingService } from './chunking.service';
-import { EmbeddingService } from './embedding.service';
-import { SearchIndexService } from './search-index.service';
-import { VectorIndexService } from './vector-index.service';
-import { PipelineDocument } from './types/pipeline.types';
+  KG_GRAPH_QUEUE,
+  RAG_REINDEX_QUEUE,
+  SEARCH_INDEX_QUEUE,
+} from './mq.constants';
+import {
+  KgBuildMessage,
+  ReindexMessage,
+  SearchIndexMessage,
+} from './messages/pipeline.messages';
+import { RabbitMqService } from './rabbitmq.service';
 
 /**
- * 发布后知识管线编排器
+ * 文档发布后管线的 MQ 消费者
  *
- * <p>RAG：分块 → Embedding → ES kh_chunk</p>
- * <p>Search：整篇快照 → ES kh_document</p>
- *
- * <p>由 {@link DocumentPipelineConsumer} 在消费到 MQ 消息后调用；</p>
- * <p>本类负责「加载文档 → 调具体服务」，不直接碰 RabbitMQ。</p>
+ * <p>消费：RAG 向量化 + Search 全文索引 + KG 建图。</p>
+ * <p>注册时机：在构造函数里 `registerHandler`，</p>
+ * 保证早于 {@link RabbitMqService.onModuleInit} 的 `bindConsumers`。
  */
 @Injectable()
-export class PipelineOrchestrator {
-  private readonly logger = new Logger(PipelineOrchestrator.name);
+export class DocumentPipelineConsumer {
+  private readonly logger = new Logger(DocumentPipelineConsumer.name);
 
   constructor(
-    @InjectEntityManager()
-    private readonly em: EntityManager,
-    @InjectModel(DocumentContent.name)
-    private readonly contentModel: Model<DocumentContentDocument>,
-    private readonly chunkingService: ChunkingService,
-    private readonly embeddingService: EmbeddingService,
-    private readonly vectorIndexService: VectorIndexService,
-    private readonly searchIndexService: SearchIndexService,
-  ) {}
-
-  /**
-   * 处理 RAG 重建 / 删除消息。
-   *
-   * 重建流水线（单文档）：清旧块 → Chunking → Embedding → 写入 ES kh_chunk
-   */
-  async handleRagReindex(type: string, documentIds?: string[]) {
-    if (type === 'DELETE_BY_DOC_IDS' && documentIds?.length) {
-      for (const id of documentIds) {
-        await this.vectorIndexService.deleteByDocId(id);
-      }
-      return;
-    }
-
-    if (type !== 'BY_DOC_IDS' || !documentIds?.length) {
-      this.logger.warn(`忽略未支持的 RAG 消息：type=${type}`);
-      return;
-    }
-
-    const docs = await this.loadDocumentsByIds(documentIds);
-    this.logger.log(`RAG 开始索引：type=${type}, total=${docs.length}`);
-
-    for (const doc of docs) {
-      try {
-        await this.reindexOne(doc);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        this.logger.error(`RAG 索引失败：documentId=${doc.id}, ${message}`);
-      }
-    }
-  }
-
-  /**
-   * 处理 Search 索引消息。
-   * INDEX：消息内已带文档快照，直接写入 ES kh_document。
-   * DELETE：按 documentId 删除。
-   */
-  async handleSearchIndex(
-    type: string,
-    documentId: string,
-    document?: Record<string, unknown>,
+    private readonly rabbit: RabbitMqService,
+    private readonly orchestrator: PipelineOrchestrator,
   ) {
-    if (type === 'DELETE') {
-      await this.searchIndexService.deleteDocument(documentId);
-      return;
-    }
-
-    if (type === 'INDEX') {
-      if (!document) {
-        this.logger.warn(
-          `Search INDEX 消息缺少 document 快照：documentId=${documentId}`,
-        );
-        return;
-      }
-      await this.searchIndexService.indexDocument(document);
-      return;
-    }
-
-    this.logger.warn(`忽略未支持的 Search 消息：type=${type}`);
+    this.rabbit.registerHandler(RAG_REINDEX_QUEUE, (msg) =>
+      this.handleRag(msg),
+    );
+    this.rabbit.registerHandler(SEARCH_INDEX_QUEUE, (msg) =>
+      this.handleSearch(msg),
+    );
+    this.rabbit.registerHandler(KG_GRAPH_QUEUE, (msg) => this.handleKg(msg));
   }
 
-  /** 单篇：分块 → 批量嵌入 → 落库 */
-  private async reindexOne(doc: PipelineDocument) {
-    if (!doc.content?.trim()) {
-      this.logger.warn(`文档内容为空，跳过 RAG：documentId=${doc.id}`);
-      return;
-    }
-
-    // 先清旧块，避免重复发布时脏数据残留
-    await this.vectorIndexService.deleteByDocId(doc.id);
-
-    const chunks = await this.chunkingService.chunk({
-      content: doc.content,
-      documentId: doc.id,
-      documentTitle: doc.title,
-      categoryId: doc.categoryId,
-      authorId: doc.authorId,
-      teamId: doc.teamId,
-      docStatus: doc.status,
-      publishTime: this.toIsoDate(doc.publishTime),
-    });
-
-    if (!chunks.length) return;
-
-    const embeddings = await this.embeddingService.embedBatch(
-      chunks.map((c) => c.content),
-    );
-    for (let i = 0; i < chunks.length; i++) {
-      chunks[i].embedding = embeddings[i];
-    }
-
-    await this.vectorIndexService.indexChunks(chunks);
+  /** RAG：分块 → 向量化 → ES kh_chunk（dense_vector） */
+  private async handleRag(msg: ConsumeMessage) {
+    const body = this.parseJson<ReindexMessage>(msg);
     this.logger.log(
-      `RAG 索引完成：documentId=${doc.id}, chunks=${chunks.length}`,
+      `[RAG] type=${body.type}, taskId=${body.taskId}, documentIds=${JSON.stringify(body.documentIds ?? [])}`,
+    );
+    await this.orchestrator.handleRagReindex(body.type, body.documentIds);
+  }
+
+  /** Search：文档级关键词索引（Elasticsearch kh_document） */
+  private async handleSearch(msg: ConsumeMessage) {
+    const body = this.parseJson<SearchIndexMessage>(msg);
+    this.logger.log(
+      `[Search] type=${body.type}, taskId=${body.taskId}, documentId=${body.documentId}`,
+    );
+    await this.orchestrator.handleSearchIndex(
+      body.type,
+      body.documentId,
+      body.document,
     );
   }
 
-  /** ES date 字段需要 ISO-8601；Date#toString() 会被拒绝 */
-  private toIsoDate(value?: Date | string | null): string | null {
-    if (value == null) return null;
-    if (value instanceof Date) {
-      return Number.isNaN(value.getTime()) ? null : value.toISOString();
-    }
-    const parsed = new Date(value);
-    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+  /** KG：分块 → 抽实体关系 → Neo4j */
+  private async handleKg(msg: ConsumeMessage) {
+    const body = this.parseJson<KgBuildMessage>(msg);
+    this.logger.log(
+      `[KG] type=${body.type}, taskId=${body.taskId}, documentIds=${JSON.stringify(body.documentIds ?? [])}`,
+    );
+    await this.orchestrator.handleKgBuild(body.type, body.documentIds);
   }
 
-  /** 按 ID 列表加载元数据 + Mongo 正文 */
-  private async loadDocumentsByIds(ids: string[]): Promise<PipelineDocument[]> {
-    const result: PipelineDocument[] = [];
-    for (const id of ids) {
-      const doc = await this.em.findOne(DocumentEntity, {
-        where: { id, deleted: false },
-      });
-      if (!doc) continue;
-      const contentDoc = await this.contentModel
-        .findOne({ _id: doc.contentId, deleted: false })
-        .lean();
-      result.push(this.toPipelineDoc(doc, contentDoc?.content ?? ''));
-    }
-    return result;
-  }
-
-  /** Postgres 实体 + Mongo 正文 → 管线统一 DTO */
-  private toPipelineDoc(
-    doc: DocumentEntity,
-    content: string,
-  ): PipelineDocument {
-    return {
-      id: doc.id,
-      title: doc.title,
-      content,
-      summary: doc.summary,
-      categoryId: doc.categoryId,
-      authorId: doc.authorId,
-      teamId: doc.teamId,
-      status: doc.status,
-      tags: doc.tags,
-      isPublic: doc.isPublic,
-      viewCount: doc.viewCount,
-      likeCount: doc.likeCount,
-      commentCount: doc.commentCount,
-      publishTime: doc.publishTime,
-      createdAt: doc.createdAt,
-      updatedAt: doc.updatedAt,
-    };
+  private parseJson<T>(msg: ConsumeMessage): T {
+    return JSON.parse(msg.content.toString('utf8')) as T;
   }
 }
