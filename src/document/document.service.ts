@@ -1,4 +1,3 @@
-import 'multer';
 import {
   Injectable,
   NotFoundException,
@@ -14,14 +13,17 @@ import { CreateDocumentDto } from './dto/create-document.dto';
 import { UpdateDocumentDto } from './dto/update-document.dto';
 import { QueryDocumentDto } from './dto/query-document.dto';
 import { UploadParseDto } from './dto/upload-parse.dto';
-import { DocumentEntity, DocumentStatus } from './entities/document.entity';
+import {
+  DocumentEntity,
+  DocumentStatus,
+} from './entities/document.entity';
 import {
   DocumentContent,
   DocumentContentDocument,
 } from './schemas/document-content.schema';
 import { RustfsService } from '../storage/rustfs.service';
-import { FileParserService } from './parser/file-parser.service';
 import { DocumentPipelinePublisher } from '../mq/document-pipeline.publisher';
+import { FileParserService } from './parser/file-parser.service';
 import {
   decodeUploadFilename,
   getExtension,
@@ -48,7 +50,6 @@ export class DocumentService {
     private readonly fileParserService: FileParserService,
     private readonly rustfs: RustfsService,
     private readonly pipelinePublisher: DocumentPipelinePublisher,
-
   ) {}
 
   /**
@@ -61,7 +62,8 @@ export class DocumentService {
     const wordCount = this.countWords(dto.content);
     const status = dto.status ?? DocumentStatus.Draft;
     // 未传 summary 时，从正文截取预览作为 contentSummary
-    const contentSummary = dto.summary ?? this.buildContentSummary(dto.content);
+    const contentSummary =
+      dto.summary ?? this.buildContentSummary(dto.content);
 
     // 先写 Mongo，_id 由驱动自动生成 ObjectId
     const contentDoc = await this.contentModel.create({
@@ -259,18 +261,18 @@ export class DocumentService {
     return { ...saved, content: contentDoc?.content ?? '' };
   }
 
-
   /**
    * 直接发布文档（不做审核）
    *
    * 流程：
    * 1. 校验文档存在且状态为草稿 / 已发布
    * 2. 写库：status=Published，刷新 publishTime
-   * 3. 读 Mongo 正文，投递 RabbitMQ（RAG 向量化）
+   * 3. 读 Mongo 正文，投递 RabbitMQ（RAG 向量化 + Search 全文索引）
    * 4. 投递失败只打日志，不回滚「已发布」状态
    *
    * 异步消费侧见 DocumentPipelineConsumer → PipelineOrchestrator：
-   * 分块(ChunkingService) → 嵌入 → ES(kh_chunk)
+   * - RAG：分块 → 嵌入 → ES(kh_chunk)
+   * - Search：整篇快照 → ES(kh_document)
    */
   async publish(id: string) {
     this.logger.log(`发布文档：documentId=${id}`);
@@ -301,7 +303,7 @@ export class DocumentService {
 
     // MQ 失败不影响发布成功
     try {
-      await this.pipelinePublisher.afterPublish(saved);
+      await this.pipelinePublisher.afterPublish(saved, content);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.warn(
@@ -315,7 +317,8 @@ export class DocumentService {
 
   /**
    * 软删除文档
-   * Postgres、Mongo 两侧都将 deleted 置为 true（不物理删正文）
+   * Postgres、Mongo 两侧都将 deleted 置为 true（不物理删正文），
+   * 并异步清理 ES 搜索索引与向量块。
    */
   async remove(id: string) {
     const doc = await this.em.findOne(DocumentEntity, {
@@ -331,6 +334,16 @@ export class DocumentService {
       { _id: doc.contentId },
       { $set: { deleted: true } },
     );
+
+    try {
+      await this.pipelinePublisher.afterUnpublish(id);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(
+        `删除后索引清理投递失败：documentId=${id}, error=${message}`,
+      );
+    }
+
     return { id, deleted: true };
   }
 
@@ -366,9 +379,7 @@ export class DocumentService {
     } catch (error) {
       if (error instanceof BadRequestException) throw error;
       const message = error instanceof Error ? error.message : String(error);
-      this.logger.error(
-        `文件解析失败：name=${originalFilename}, error=${message}`,
-      );
+      this.logger.error(`文件解析失败：name=${originalFilename}, error=${message}`);
       throw new BadRequestException(`文件解析失败: ${message}`);
     }
 
