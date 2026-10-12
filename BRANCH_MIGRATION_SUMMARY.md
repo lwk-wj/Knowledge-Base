@@ -1,6 +1,6 @@
 # Knowledge Hub Backend 版本演进与改造全流程实战指南
 
-本文档系统性汇总从 **v1 到 v6** 每个版本的**业务定位、架构图解、完整改造流程、核心代码实现步骤与联调测试方法**，作为各阶段版本迭代升级的实战手册。
+本文档系统性汇总从 **v1 到 v7** 每个版本的**业务定位、架构图解、完整改造流程、核心代码实现步骤与联调测试方法**，作为各阶段版本迭代升级的实战手册。
 
 ---
 
@@ -12,6 +12,7 @@
 - [v4 分支：双管线架构——全文检索 (Search) 与索引双向清理](#v4-分支双管线架构全文检索-search-与索引双向清理)
 - [v5 分支：三管线架构——LLM 实体关系抽取与 Neo4j 知识图谱 (KG)](#v5-分支三管线架构llm-实体关系抽取与-neo4j-知识图谱-kg)
 - [v6 分支：企业级文档状态机与多级审批流 (Review & Status Machine)](#v6-分支企业级文档状态机与多级审批流-review--status-machine)
+- [v7 分支：JWT 用户认证与基于角色的权限控制 (RBAC)](#v7-分支jwt-用户认证与基于角色的权限控制-rbac)
 
 ---
 
@@ -24,6 +25,7 @@ v1: 基础 CRUD (Postgres 元数据 + Mongo 正文 + 雪花 ID)
            └─► v4: 双管线 Search (新增 ES kh_document 全文索引 + 下架/删除双向清理)
                 └─► v5: 三管线 KG (接入 Neo4j 图数据库 + LLM 抽取实体关系)
                      └─► v6: 企业级状态机 (Draft -> PendingReview -> Published -> Archived 审批流)
+                          └─► v7: 用户认证与 RBAC 鉴权 (JWT 守卫 + 角色隔离 + 身份自动注入)
 ```
 
 ---
@@ -247,28 +249,130 @@ v1: 基础 CRUD (Postgres 元数据 + Mongo 正文 + 雪花 ID)
 
 ---
 
-## 快速联调与测试命令对照表
+## v7 分支：JWT 用户认证与基于角色的权限控制 (RBAC)
 
-### 1. 发布与审核流测试
-```bash
-# 提审
-curl -s -X PUT "http://localhost:3000/documents/${DOC_ID}/publish" | jq '{id, status}'
+### 1. 核心定位与业务场景
+为全站提供统一身份认证与基于角色访问控制（RBAC），杜绝接口参数伪造身份或越权审核。
 
-# 查看待办
-curl -s "http://localhost:3000/documents/reviews/tasks?status=pending" | jq
-
-# 审核通过（触发建索引）
-curl -s -X POST "http://localhost:3000/documents/reviews/tasks/${TASK_ID}/approve" \
-  -H 'Content-Type: application/json' \
-  -d '{"reviewerName": "审核员", "reviewComment": "准予发布"}' | jq
-
-# 归档 / 下架（触发清索引）
-curl -s -X PUT "http://localhost:3000/documents/${DOC_ID}/archive" | jq '{id, status}'
-curl -s -X PUT "http://localhost:3000/documents/${DOC_ID}/save-draft" | jq '{id, status}'
+```text
+                                  【客户端请求】
+                                       │
+                                       ▼
+                     ┌───────────────────────────────────┐
+                     │ 全局守卫 1: JwtAuthGuard          │
+                     │ (校验 Authorization: Bearer Token) │
+                     │  - 标记了 @Public() 的接口直接放行 │
+                     └─────────────────┬─────────────────┘
+                                       │ 校验通过，注入 req.user
+                                       ▼
+                     ┌───────────────────────────────────┐
+                     │ 全局守卫 2: RolesGuard            │
+                     │ (校验用户是否具备 @Roles(...) 权限)│
+                     │  - 如审核接口要求 ROLE_REVIEWER   │
+                     └─────────────────┬─────────────────┘
+                                       │ 角色通过
+                                       ▼
+                              【业务 Controller】
+          (@CurrentUser() 自动提取 authorId / reviewerId，无需前端传)
 ```
 
-### 2. 存储与索引验证
-- **RabbitMQ 管理后台**：`http://localhost:15672` (guest / guest)
-- **ES 向量索引查询**：`GET /kh_chunk/_search`
-- **ES 全文索引查询**：`GET /kh_document/_search`
-- **Neo4j 图谱浏览器**：`http://localhost:7474` (neo4j / 12345678)
+### 2. 核心改动点
+1. **全局受保护与白名单机制**：
+   - 默认所有接口均受 `JwtAuthGuard` 拦截，必须提供有效 Bearer Token。
+   - 登录 (`POST /auth/login`)、注册 (`POST /auth/register`) 标注 `@Public()` 白名单。
+2. **自动注入身份**：
+   - 创建文档与上传解析时，`authorId` / `createBy` 由当前登录用户 Token 自动提供，防止前端恶意篡改。
+3. **权限角色隔离**：
+   - 审核员工作台（`/reviews/tasks`）、通过 (`approve`)、驳回 (`reject`) 接口强制打上 `@Roles('ROLE_REVIEWER', 'ROLE_ADMIN')` 守卫，普通用户访问直接响应 `403 Forbidden`。
+
+### 3. 改造流程与开发步骤
+1. **安装认证依赖**：
+   ```bash
+   pnpm add @nestjs/jwt @nestjs/passport passport passport-jwt bcryptjs
+   pnpm add -D @types/passport-jwt @types/bcryptjs
+   ```
+2. **Postgres 建表与初始账号**：
+   - 创建 `kh_user`（用户表，密码使用 bcrypt 哈希）。
+   - 创建 `kh_role`（预置 `ROLE_ADMIN`、`ROLE_REVIEWER`、`ROLE_USER`）。
+   - 创建 `kh_user_role`（用户与角色多对多映射）。
+   - 初始化预置账号：`admin/123456`, `reviewer/123456`, `user/123456`。
+3. **开发用户模块 (`src/user/`) 与角色常量**：
+   - `src/common/constants/roles.ts`：定义常量编码。
+   - `UserEntity`, `RoleEntity`, `UserRoleEntity`。
+   - `UserService`：提供根据 username 查用户、校验密码与获取角色数组。
+4. **开发 Auth 鉴权模块 (`src/auth/`)**：
+   - `JwtStrategy`：提取请求头 `Authorization: Bearer <token>` 并解密为 `AuthUser`。
+   - `JwtAuthGuard`：配合 `@Public()` 装饰器实现全局放行判定。
+   - `RolesGuard`：配合 `@Roles()` 装饰器校验当前用户角色。
+   - `@CurrentUser()`：自定义参数装饰器，直接获取 `req.user`。
+   - `AuthService`：`login` 校验密码并生成 JWT。
+   - `AuthController`：暴露 `/auth/login`, `/auth/register`, `/auth/me`。
+5. **在 `AppModule` 注册全局守卫**：
+   ```typescript
+   providers: [
+     { provide: APP_GUARD, useClass: JwtAuthGuard },
+     { provide: APP_GUARD, useClass: RolesGuard },
+   ]
+   ```
+6. **改造 `DocumentController`**：
+   - `create` 与 `uploadAndParse` 接入 `@CurrentUser() user: AuthUser`，移除前端手填 `authorId`。
+   - 审核相关接口加入 `@Roles(RoleCode.REVIEWER, RoleCode.ADMIN)` 守卫，自动绑定 `reviewerId = user.userId`。
+
+---
+
+## 快速联调与测试命令对照表
+
+### 1. 登录认证与获取 Token
+```bash
+export BASE=http://localhost:3000
+
+# 普通用户登录
+USER_TOKEN=$(curl -s -X POST "$BASE/auth/login" \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"user","password":"123456"}' | jq -r '.accessToken')
+
+# 审核员登录
+REVIEWER_TOKEN=$(curl -s -X POST "$BASE/auth/login" \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"reviewer","password":"123456"}' | jq -r '.accessToken')
+```
+
+### 2. 携带 Token 上传并发布文档
+```bash
+# 1. 上传文件创建草稿（身份自动注入）
+DOC_RESP=$(curl -s -X POST "$BASE/documents/upload/parse" \
+  -H "Authorization: Bearer $USER_TOKEN" \
+  -F 'file=@./test-files/01-travel-expense-policy.pdf' \
+  -F 'tags=差旅,SOP')
+DOC_ID=$(echo $DOC_RESP | jq -r '.documentId')
+
+# 2. 普通用户提交审核（status -> 3 待审核）
+curl -s -X PUT "$BASE/documents/${DOC_ID}/publish" \
+  -H "Authorization: Bearer $USER_TOKEN" | jq '{id, status}'
+
+# 3. 普通用户尝试查看待办（期望返回 403 Forbidden 权限拦截）
+curl -s "$BASE/documents/reviews/tasks?status=pending" \
+  -H "Authorization: Bearer $USER_TOKEN" | jq
+
+# 4. 审核员查看待办并获取任务 ID
+TASK_ID=$(curl -s "$BASE/documents/reviews/tasks?status=pending" \
+  -H "Authorization: Bearer $REVIEWER_TOKEN" | jq -r '.items[0].id')
+
+# 5. 审核员审批通过（文档 status -> 1，触发投递 RAG/Search/KG 三管道建立索引）
+curl -s -X POST "$BASE/documents/reviews/tasks/${TASK_ID}/approve" \
+  -H "Authorization: Bearer $REVIEWER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"reviewComment": "符合要求准予发布"}' | jq '{id, status, publishTime}'
+
+# 6. 归档 / 下架（清空三管道索引）
+curl -s -X PUT "$BASE/documents/${DOC_ID}/archive" \
+  -H "Authorization: Bearer $USER_TOKEN" | jq '{id, status}'
+curl -s -X PUT "$BASE/documents/${DOC_ID}/save-draft" \
+  -H "Authorization: Bearer $USER_TOKEN" | jq '{id, status}'
+```
+
+### 3. 后台服务管理端验证
+- **RabbitMQ 消息队列面板**：`http://localhost:15672` (guest / guest)
+- **ES 向量切片索引查询**：`GET /kh_chunk/_search`
+- **ES 全文快照索引查询**：`GET /kh_document/_search`
+- **Neo4j 知识图谱控制台**：`http://localhost:7474` (neo4j / 12345678)
