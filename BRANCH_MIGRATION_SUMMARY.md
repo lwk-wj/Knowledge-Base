@@ -1,6 +1,6 @@
 # Knowledge Hub Backend 版本演进与改造全流程实战指南
 
-本文档系统性汇总从 **v1 到 v7** 每个版本的**业务定位、架构图解、完整改造流程、核心代码实现步骤与联调测试方法**，作为各阶段版本迭代升级的实战手册。
+本文档系统性汇总从 **v1 到 v8** 每个版本的**业务定位、架构图解、完整改造流程、核心代码实现步骤与联调测试方法**，作为各阶段版本迭代升级的实战手册。
 
 ---
 
@@ -13,6 +13,8 @@
 - [v5 分支：三管线架构——LLM 实体关系抽取与 Neo4j 知识图谱 (KG)](#v5-分支三管线架构llm-实体关系抽取与-neo4j-知识图谱-kg)
 - [v6 分支：企业级文档状态机与多级审批流 (Review & Status Machine)](#v6-分支企业级文档状态机与多级审批流-review--status-machine)
 - [v7 分支：JWT 用户认证与基于角色的权限控制 (RBAC)](#v7-分支jwt-用户认证与基于角色的权限控制-rbac)
+- [v8 分支：用户与角色全生命周期管理、Redis 缓存与邮件安全服务](#v8-分支用户与角色全生命周期管理redis-缓存与邮件安全服务)
+- [快速联调与测试命令对照表](#快速联调与测试命令对照表)
 
 ---
 
@@ -26,6 +28,7 @@ v1: 基础 CRUD (Postgres 元数据 + Mongo 正文 + 雪花 ID)
                 └─► v5: 三管线 KG (接入 Neo4j 图数据库 + LLM 抽取实体关系)
                      └─► v6: 企业级状态机 (Draft -> PendingReview -> Published -> Archived 审批流)
                           └─► v7: 用户认证与 RBAC 鉴权 (JWT 守卫 + 角色隔离 + 身份自动注入)
+                               └─► v8: 用户/角色全生命周期管理 + Redis 缓存 + 邮件安全 (User/Role CRUD + 邮箱激活/重置密码)
 ```
 
 ---
@@ -320,6 +323,76 @@ v1: 基础 CRUD (Postgres 元数据 + Mongo 正文 + 雪花 ID)
 
 ---
 
+## v8 分支：用户与角色全生命周期管理、Redis 缓存与邮件安全服务
+
+### 1. 核心定位与业务场景
+在 v7 基础登录与守卫之上，构建完整的企业级**用户/角色全生命周期管理后台 (User/Role Admin)**、**个人中心与统计**，并接入 **Redis 7.0 缓存层** 与 **SMTP 邮件发送服务**，提供**邮箱激活**与**验证码忘记密码重置**能力。
+
+```text
+                               【客户端请求】
+                                     │
+         ┌───────────────────────────┼───────────────────────────┐
+         ▼                           ▼                           ▼
+  1. 账户安全与邮件流            2. 用户管理 (User)          3. 角色管理 (Role)
+  ┌──────────────────────┐    ┌──────────────────────┐    ┌──────────────────────┐
+  │ - 邮箱激活 Token     │    │ - 管理员: 用户 CRUD   │    │ - 管理员: 角色 CRUD   │
+  │ - 忘记密码: 6位验证码 │    │   (分页/启禁用/分角色) │    │   (列表/新增/改/删)   │
+  │ - 邮件发送 (Nodemailer)│   │ - 个人中心:           │    │ - 绑定校验 (防止误删) │
+  └──────────┬───────────┘    │   资料/修改密码/数据统计 │    └──────────────────────┘
+             │                └──────────────────────┘
+             ▼
+     【Redis 7.0 缓存层】
+     (存储 Token 24h / 验证码 10min)
+```
+
+### 2. 核心改动点
+1. **Redis 缓存层引入**：
+   - 接入 Redis 7.alpine 容器与 RedisInsight 可视化后台。
+   - 封装全局 `RedisService`（提供 `get`, `set`, `setEx`, `del` 操作）。
+2. **SMTP 邮件发送与账户安全 (`EmailService`)**：
+   - 集成 `@nestjs-modules/mailer` 与 `nodemailer`。
+   - **邮箱激活流 (`EmailActivationService`)**：配置 `REQUIRE_EMAIL_VERIFICATION=true` 时，新注册用户状态为未激活(0)，生成 24 小时有效的激活 Token 写入 Redis，发送激活链接邮件。
+   - **忘记密码重置流 (`PasswordResetService`)**：输入邮箱获取 6 位数字验证码（Redis 10分钟有效期），校验验证码后完成新密码重置。
+3. **角色管理全流程 (Role CRUD)**：
+   - 管理员专用接口 (`@Roles(RoleCode.ADMIN)`)：角色列表、新增角色、修改角色信息。
+   - **防误删保护机制**：删除角色前检查是否仍有用户绑定该角色，有绑定则拒绝删除。
+4. **用户管理全流程 (User Admin & Profile)**：
+   - **管理员工作台 (`UserController`)**：用户分页综合检索（状态/角色/关键字模糊匹配）、管理员直接新建用户并分配角色、启用/禁用用户、批量分配角色、重置用户密码、软删除用户。
+   - **个人中心**：获取本人资料 (`/me/profile`)、修改姓名/头像、修改密码 (`/me/password` 校验原密码)、个人知识库数据统计 (`/me/stats` 统计名下文档数、已发布数、待审核数等)。
+
+### 3. 改造流程与开发步骤
+1. **安装依赖**：
+   ```bash
+   pnpm add ioredis @nestjs-modules/mailer nodemailer
+   pnpm add -D @types/nodemailer
+   ```
+2. **Docker 与环境配置**：
+   - 在 `docker-compose.yml` 中启动 `redis` (端口 6379) 与 `redisinsight` (端口 5540)。
+   - 在 `.env` 中配置 `REDIS_HOST`, `REDIS_PORT`, `MAIL_HOST`, `MAIL_USER`, `MAIL_PASS` 等。
+3. **封装全局 Redis 模块 (`src/redis/`)**：
+   - 创建 `RedisService`（基于 ioredis 客户端封装，支持 `setEx` 过期时间写入）。
+   - 创建 `RedisModule`（标记为 `@Global()` 并导出）。
+4. **开发邮件与安全子服务 (`src/auth/`)**：
+   - `email.service.ts`：发送 HTML 格式的激活邮件与密码重置验证码邮件。
+   - `email-activation.service.ts`：生成并校验 Redis 中的激活 Token（24h）。
+   - `password-reset.service.ts`：生成并消费 Redis 中的 6 位重置验证码（10min）。
+5. **完善 AuthController 端点**：
+   - `GET /auth/verify-email?token=...`（邮箱激活链接）。
+   - `POST /auth/password/reset/send-code`（发送重置验证码）。
+   - `POST /auth/password/reset`（重置密码）。
+   - `POST /auth/logout`（登出）。
+6. **开发角色服务与控制器 (`src/user/`)**：
+   - `role.service.ts`：角色增删改查 + 用户绑定依赖检查。
+   - `role.controller.ts`：前缀 `/roles`，全部路由受 `@Roles(RoleCode.ADMIN)` 保护。
+7. **开发用户服务与控制器 (`src/user/`)**：
+   - 创建 DTO：`QueryUserDto`, `CreateUserDto`, `UpdateUserDto`, `AssignRolesDto`, `ChangePasswordDto`, `ProfileDto`。
+   - 扩展 `user.service.ts`：实现分页列表、状态变更、管理员重置密码、个人数据统计（文档数聚合）。
+   - `user.controller.ts`：暴露管理员管理端点与普通用户个人中心端点。
+8. **AppModule 注册 MailerModule**：
+   - 在 `AppModule` 引入 `MailerModule.forRootAsync` 配置 SMTP 连接池。
+
+---
+
 ## 快速联调与测试命令对照表
 
 ### 1. 登录认证与获取 Token
@@ -335,43 +408,100 @@ USER_TOKEN=$(curl -s -X POST "$BASE/auth/login" \
 REVIEWER_TOKEN=$(curl -s -X POST "$BASE/auth/login" \
   -H 'Content-Type: application/json' \
   -d '{"username":"reviewer","password":"123456"}' | jq -r '.accessToken')
+
+# 管理员登录
+ADMIN_TOKEN=$(curl -s -X POST "$BASE/auth/login" \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"123456"}' | jq -r '.accessToken')
 ```
 
-### 2. 携带 Token 上传并发布文档
+### 2. 角色管理测试 (管理员)
 ```bash
-# 1. 上传文件创建草稿（身份自动注入）
+# 查询角色列表
+curl -s "$BASE/roles/list" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq
+
+# 创建新角色
+curl -s -X POST "$BASE/roles" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"roleName":"内容运营","roleCode":"ROLE_OPERATOR","description":"内容维护"}' | jq
+```
+
+### 3. 用户管理测试 (管理员)
+```bash
+# 分页查询用户（带关键字与角色筛选）
+curl -s "$BASE/users?page=1&pageSize=10&keyword=李四" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq
+
+# 管理员创建用户并分配角色
+curl -s -X POST "$BASE/users" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"editor01","password":"123456","realName":"编辑小王","roleCodes":["ROLE_USER"]}' | jq
+
+# 禁用用户
+USER_ID='替换成用户 ID'
+curl -s -X PUT "$BASE/users/${USER_ID}/status" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"status": 0}' | jq
+```
+
+### 4. 个人中心测试 (普通用户)
+```bash
+# 查询本人个人资料
+curl -s "$BASE/users/me/profile" \
+  -H "Authorization: Bearer $USER_TOKEN" | jq
+
+# 查询本人知识库统计数据
+curl -s "$BASE/users/me/stats" \
+  -H "Authorization: Bearer $USER_TOKEN" | jq
+
+# 修改本人密码
+curl -s -X PUT "$BASE/users/me/password" \
+  -H "Authorization: Bearer $USER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"oldPassword":"123456","newPassword":"newpassword123"}' | jq
+```
+
+### 5. 密码重置流测试 (Redis 验证码)
+```bash
+# 1. 发送 6 位邮箱验证码（存 Redis 10分钟）
+curl -s -X POST "$BASE/auth/password/reset/send-code" \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"your_email@domain.com"}' | jq
+
+# 2. 提交验证码与新密码
+curl -s -X POST "$BASE/auth/password/reset" \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"your_email@domain.com","code":"123456","newPassword":"newpassword666"}' | jq
+```
+
+### 6. 文档发布与审核流测试
+```bash
+# 上传创建草稿
 DOC_RESP=$(curl -s -X POST "$BASE/documents/upload/parse" \
   -H "Authorization: Bearer $USER_TOKEN" \
   -F 'file=@./test-files/01-travel-expense-policy.pdf' \
   -F 'tags=差旅,SOP')
 DOC_ID=$(echo $DOC_RESP | jq -r '.documentId')
 
-# 2. 普通用户提交审核（status -> 3 待审核）
+# 普通用户提交审核
 curl -s -X PUT "$BASE/documents/${DOC_ID}/publish" \
   -H "Authorization: Bearer $USER_TOKEN" | jq '{id, status}'
 
-# 3. 普通用户尝试查看待办（期望返回 403 Forbidden 权限拦截）
-curl -s "$BASE/documents/reviews/tasks?status=pending" \
-  -H "Authorization: Bearer $USER_TOKEN" | jq
-
-# 4. 审核员查看待办并获取任务 ID
+# 审核员审核通过（触发 RAG/Search/KG 索引）
 TASK_ID=$(curl -s "$BASE/documents/reviews/tasks?status=pending" \
   -H "Authorization: Bearer $REVIEWER_TOKEN" | jq -r '.items[0].id')
-
-# 5. 审核员审批通过（文档 status -> 1，触发投递 RAG/Search/KG 三管道建立索引）
 curl -s -X POST "$BASE/documents/reviews/tasks/${TASK_ID}/approve" \
   -H "Authorization: Bearer $REVIEWER_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"reviewComment": "符合要求准予发布"}' | jq '{id, status, publishTime}'
-
-# 6. 归档 / 下架（清空三管道索引）
-curl -s -X PUT "$BASE/documents/${DOC_ID}/archive" \
-  -H "Authorization: Bearer $USER_TOKEN" | jq '{id, status}'
-curl -s -X PUT "$BASE/documents/${DOC_ID}/save-draft" \
-  -H "Authorization: Bearer $USER_TOKEN" | jq '{id, status}'
 ```
 
-### 3. 后台服务管理端验证
+### 7. 后台服务管理端验证
+- **RedisInsight 可视化后台**：`http://localhost:5540`
 - **RabbitMQ 消息队列面板**：`http://localhost:15672` (guest / guest)
 - **ES 向量切片索引查询**：`GET /kh_chunk/_search`
 - **ES 全文快照索引查询**：`GET /kh_document/_search`
