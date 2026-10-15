@@ -506,3 +506,27 @@ curl -s -X POST "$BASE/documents/reviews/tasks/${TASK_ID}/approve" \
 - **ES 向量切片索引查询**：`GET /kh_chunk/_search`
 - **ES 全文快照索引查询**：`GET /kh_document/_search`
 - **Neo4j 知识图谱控制台**：`http://localhost:7474` (neo4j / 12345678)
+
+---
+
+## 8. 注册流程业务改造（国内主流邮箱验证码模式）
+
+针对原有“先入库为未激活状态，后发邮件激活链接”容易被恶意滥用、产生未验证脏数据的问题，已优化为**国内主流的“先发验证码 -> 验证成功才入库”模式**：
+
+### 核心改进点
+1. **彻底杜绝无效垃圾数据**：
+   - 只有当用户输入的 6 位验证码校验正确无误时，才会执行落库逻辑。
+   - 用户入库后状态直接为激活状态（`status = 1, emailVerified = 1`），无缝即可登录。
+2. **防刷与安全控制**：
+   - Redis 缓存验证码 Key 命名：`email:register:code:${email}`。
+   - **有效时间（TTL）**：10 分钟（600 秒）。
+   - **防刷冷却机制**：同一邮箱 60 秒内禁止重复发送（校验 Redis 剩余 TTL > 540 秒时拦截请求）。
+   - **防重复利用**：注册成功后，立即消费并删除 Redis 验证码。
+3. **改造涉及文件清单**：
+   - `src/auth/dto/auth.dto.ts`：新增 `SendRegisterCodeDto`；`RegisterDto` 将 `email` 与 `code`（6 位数字）设为必填。
+   - `src/auth/register-code.service.ts`：实现基于 Redis 的验证码存储、防刷 TTL 查询、校验与删除。
+   - `src/auth/email.service.ts`：新增 `sendRegisterCodeEmail(email, code)` 邮件模板。
+   - `src/auth/auth.controller.ts`：新增开放端点 `POST /auth/register/send-code`。
+   - `src/auth/auth.service.ts`：实现 `sendRegisterCode`（查重、防刷、生码、存 Redis、发邮件）与重构 `register`（先比对 Redis 验证码，成功后写入数据库）。
+   - `src/auth/auth.module.ts`：在 providers 中注入 `RegisterCodeService`。
+   - `curl-auth.md`：同步更新注册接口测试指南。

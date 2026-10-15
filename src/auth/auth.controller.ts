@@ -1,6 +1,6 @@
 import { Body, Controller, Get, Post, Put, Query } from '@nestjs/common';
 import { AuthService } from './auth.service';
-import { LoginDto, RefreshTokenDto, RegisterDto } from './dto/auth.dto';
+import { LoginDto, RefreshTokenDto, RegisterDto, SendRegisterCodeDto } from './dto/auth.dto';
 import { ResetPasswordByEmailDto, SendResetCodeDto } from '../user/dto/extra.dto';
 import { Public } from './decorators/public.decorator';
 import { CurrentUser } from './decorators/current-user.decorator';
@@ -11,6 +11,12 @@ import { RoleCode } from '../common/constants/roles';
 @Controller('auth')
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
+
+  @Public()
+  @Post('register/send-code')
+  sendRegisterCode(@Body() dto: SendRegisterCodeDto) {
+    return this.authService.sendRegisterCode(dto);
+  }
 
   @Public()
   @Post('register')

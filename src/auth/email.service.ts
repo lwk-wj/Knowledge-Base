@@ -9,6 +9,21 @@ export class EmailService {
     private readonly config: ConfigService,
   ) {}
 
+  async sendRegisterCodeEmail(email: string, code: string): Promise<void> {
+    await this.mailer.sendMail({
+      to: email,
+      subject: '知识库账户注册验证码',
+      text: `您好，欢迎注册知识库，您的注册验证码是：${code}，10 分钟内有效，请勿泄露给他人。`,
+      html: `
+        <p>您好，</p>
+        <p>欢迎注册知识库，您的注册验证码为：</p>
+        <p style="font-size:24px;font-weight:bold;letter-spacing:4px;color:#1890ff;">${code}</p>
+        <p>验证码 10 分钟内有效，请勿泄露给他人。</p>
+        <p>如非本人操作，请忽略此邮件。</p>
+      `,
+    });
+  }
+
   async sendActivationEmail(
     email: string,
     username: string,

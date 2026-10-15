@@ -1,6 +1,7 @@
 # 用户鉴权测试 curl
 
-默认 **注册后立即可登录**（`REQUIRE_EMAIL_VERIFICATION=false`）。设为 `true` 时需邮箱激活。文档接口默认需 JWT；审核接口需 `ROLE_REVIEWER` 或 `ROLE_ADMIN`。
+注册采用**国内主流模式：先发邮箱验证码（Redis 缓存 10 分钟，60s 防刷冷却） -> 提交注册信息与验证码 -> 验证通过后直接落库激活**。
+文档接口默认需 JWT；审核接口需 `ROLE_REVIEWER` 或 `ROLE_ADMIN`。
 
 ## 预置测试账号
 
@@ -23,7 +24,7 @@ export BASE=http://localhost:3000
 ```bash
 curl -s -X POST "$BASE/auth/login" \
   -H 'Content-Type: application/json' \
-  -d '{"username":"wanger","password":"654321"}' | jq
+  -d '{"username":"liwk","password":"123456"}' | jq
 ```
 
 ```bash
@@ -53,36 +54,40 @@ curl -s "$BASE/auth/me" \
 
 ---
 
-## 3. 注册（默认 ROLE_USER）
+## 3. 注册新用户（验证码模式，默认 ROLE_USER）
+
+### 步骤 1：发送注册验证码至邮箱
+验证码 10 分钟有效，同一邮箱 60 秒内防重复点击。
+
+```bash
+curl -s -X POST "$BASE/auth/register/send-code" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "email": "1364848261@qq.com"
+  }' | jq
+```
+*提示：可查收邮件，或使用 `docker exec -it knowledge-hub-redis redis-cli get "email:register:code:1364848261@qq.com"` 快速查看。*
+
+### 步骤 2：提交注册表单（携带验证码）
+验证码校验通过后直接写入数据库（状态为已激活 `status=1`），杜绝垃圾待激活用户。
 
 ```bash
 curl -s -X POST "$BASE/auth/register" \
   -H 'Content-Type: application/json' \
   -d '{
-    "username": "zhangsan",
+    "username": "liwk",
     "password": "123456",
     "email": "1364848261@qq.com",
-    "realName": "张三"
+    "code": "473195",
+    "realName": "文凯"
   }' | jq
 ```
 
-注册成功后用新账号走登录 curl。
+注册成功后即可直接使用新账号走上述第 1 步登录接口。
 
 ---
 
-## 4. 邮箱激活（REQUIRE_EMAIL_VERIFICATION=true 时）
-
-注册成功后会向邮箱发送激活链接，token 存 Redis（24 小时有效）。
-
-```bash
-ACTIVATION_TOKEN='替换成邮件中的 token'
-
-curl -s "$BASE/auth/verify-email?token=$ACTIVATION_TOKEN" | jq
-```
-
----
-
-## 5. 忘记密码（两步，验证码存 Redis，10 分钟有效）
+## 4. 忘记密码（两步，验证码存 Redis，10 分钟有效）
 
 需配置 `MAIL_*` 与 `REDIS_*`（见 `.env.example`）。
 
@@ -100,7 +105,7 @@ curl -s -X POST "$BASE/auth/password/reset" \
 
 ---
 
-## 6. 刷新 Token
+## 5. 刷新 Token
 
 ```bash
 REFRESH='替换成 login 返回的 refreshToken'
@@ -112,7 +117,7 @@ curl -s -X POST "$BASE/auth/refresh" \
 
 ---
 
-## 7. 退出登录
+## 6. 退出登录
 
 ```bash
 curl -s -X POST "$BASE/auth/logout" \
@@ -123,7 +128,7 @@ curl -s -X POST "$BASE/auth/logout" \
 
 ---
 
-## 8. 审核员 ID 列表
+## 7. 审核员 ID 列表
 
 ```bash
 curl -s "$BASE/auth/reviewer-ids" \
@@ -132,7 +137,7 @@ curl -s "$BASE/auth/reviewer-ids" \
 
 ---
 
-## 9. 带 Token 调用文档接口（示例）
+## 8. 带 Token 调用文档接口（示例）
 
 上传 PDF 创建草稿（普通用户）：
 

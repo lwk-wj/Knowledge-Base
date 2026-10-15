@@ -3,16 +3,26 @@ import {
   UnauthorizedException,
   NotFoundException,
   BadRequestException,
+  ConflictException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { AuthUser } from './auth-user.interface';
-import { LoginDto, RegisterDto } from './dto/auth.dto';
+import { LoginDto, RegisterDto, SendRegisterCodeDto } from './dto/auth.dto';
 import { ResetPasswordByEmailDto, SendResetCodeDto } from '../user/dto/extra.dto';
 import { UserService } from '../user/user.service';
 import { EmailService } from './email.service';
 import { EmailActivationService } from './email-activation.service';
-import { PasswordResetService, RESET_CODE_COOLDOWN_SECONDS, RESET_CODE_TTL_SECONDS } from './password-reset.service';
+import {
+  RegisterCodeService,
+  REGISTER_CODE_COOLDOWN_SECONDS,
+  REGISTER_CODE_TTL_SECONDS,
+} from './register-code.service';
+import {
+  PasswordResetService,
+  RESET_CODE_COOLDOWN_SECONDS,
+  RESET_CODE_TTL_SECONDS,
+} from './password-reset.service';
 
 export interface LoginResult {
   accessToken: string;
@@ -36,6 +46,7 @@ export class AuthService {
     private readonly config: ConfigService,
     private readonly emailService: EmailService,
     private readonly emailActivation: EmailActivationService,
+    private readonly registerCode: RegisterCodeService,
     private readonly passwordReset: PasswordResetService,
   ) {}
 
@@ -57,13 +68,6 @@ export class AuthService {
     if (unit === 'm') return n * 60;
     if (unit === 'h') return n * 3600;
     return n * 86400;
-  }
-
-  private requireEmailVerification(): boolean {
-    return (
-      this.config.get<string>('REQUIRE_EMAIL_VERIFICATION', 'false') ===
-      'true'
-    );
   }
 
   private signAccessToken(user: AuthUser): string {
@@ -97,32 +101,50 @@ export class AuthService {
     return this.buildLoginResult(user);
   }
 
+  /** 发送注册邮箱验证码（10分钟有效，60秒冷却防刷） */
+  async sendRegisterCode(dto: SendRegisterCodeDto): Promise<{ message: string }> {
+    const exists = await this.userService.findByEmail(dto.email);
+    if (exists) {
+      throw new ConflictException('该邮箱已被注册');
+    }
+
+    // 检查冷却时间：剩余 TTL 大于 (总TTL - 冷却时间) 说明刚发过不久
+    const ttl = await this.registerCode.getTtl(dto.email);
+    if (ttl > REGISTER_CODE_TTL_SECONDS - REGISTER_CODE_COOLDOWN_SECONDS) {
+      throw new BadRequestException('验证码发送过于频繁，请稍后再试');
+    }
+
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    await this.registerCode.set(dto.email, code);
+    try {
+      await this.emailService.sendRegisterCodeEmail(dto.email, code);
+    } catch {
+      await this.registerCode.delete(dto.email);
+      throw new BadRequestException('验证码邮件发送失败，请稍后再试');
+    }
+
+    return { message: '验证码已发送至您的邮箱，10 分钟内有效' };
+  }
+
+  /** 注册：验证码校验通过后才入库，直接激活状态 */
   async register(
     dto: RegisterDto,
-  ): Promise<{ userId: string; message: string; emailVerificationRequired?: boolean }> {
+  ): Promise<{ userId: string; message: string }> {
+    const isValid = await this.registerCode.verify(dto.email, dto.code);
+    if (!isValid) {
+      throw new BadRequestException('验证码错误或已过期');
+    }
+
     const result = await this.userService.register({
-      ...dto,
-      requireEmailVerification: this.requireEmailVerification(),
+      username: dto.username,
+      password: dto.password,
+      email: dto.email,
+      realName: dto.realName,
+      requireEmailVerification: false,
     });
 
-    if (result.emailVerificationRequired && dto.email) {
-      const token = await this.emailActivation.createToken(result.userId);
-      try {
-        await this.emailService.sendActivationEmail(
-          dto.email,
-          dto.username,
-          token,
-        );
-      } catch {
-        await this.emailActivation.deleteByToken(token);
-        throw new BadRequestException('激活邮件发送失败，请稍后再试');
-      }
-      return {
-        userId: result.userId,
-        message: '注册成功，请查收邮件激活账户',
-        emailVerificationRequired: true,
-      };
-    }
+    // 注册成功，移除已消费的验证码
+    await this.registerCode.delete(dto.email);
 
     return {
       userId: result.userId,
