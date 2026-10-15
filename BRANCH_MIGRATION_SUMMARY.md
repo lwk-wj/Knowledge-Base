@@ -530,3 +530,86 @@ curl -s -X POST "$BASE/documents/reviews/tasks/${TASK_ID}/approve" \
    - `src/auth/auth.service.ts`：实现 `sendRegisterCode`（查重、防刷、生码、存 Redis、发邮件）与重构 `register`（先比对 Redis 验证码，成功后写入数据库）。
    - `src/auth/auth.module.ts`：在 providers 中注入 `RegisterCodeService`。
    - `curl-auth.md`：同步更新注册接口测试指南。
+
+---
+
+## 9. v8 -> v9 分支升级改造指南（RBAC 细粒度权限与团队 Team 模块）
+
+### 9.1 改造背景与核心目标
+在 v8 阶段，系统仅具备粗粒度的角色守卫（`ROLE_ADMIN` / `ROLE_REVIEWER` / `ROLE_USER`），无法支撑“菜单/按钮/接口级权限控制”以及“企业组织架构/团队协作”。
+**v9 的核心目标**：
+1. **细粒度权限控制（Permission RBAC）**：
+   - 支持权限树（菜单、按钮、接口三类权限）。
+   - 支持双重授权模型：**角色绑定权限（Role-Permission）** + **用户直接绑定特殊权限（User-Permission）**。
+   - 实现 `@RequirePermission(...)` 装饰器与全局 `PermissionsGuard`，在 JWT 登录后自动汇聚用户的“角色权限 + 直接权限”，支持超级管理员自动放行。
+2. **企业组织团队架构（Team 模块）**：
+   - 支持无限级树形团队组织结构（`kh_team`）。
+   - 支持团队成员与成员角色管理（`leader` / `member`）。
+
+---
+
+### 9.2 涉及变动的文件清单总览
+
+| 模块 | 变更类型 | 文件路径 | 核心职责 |
+|------|----------|----------|----------|
+| **SQL 脚本** | 修改 | `init-scripts/postgresql/init.sql` | 新增 `kh_permission`, `kh_role_permission`, `kh_user_permission`, `kh_team`, `kh_team_member` 表及初始化数据 |
+| **常量定义** | 新增 | `src/common/constants/permissions.ts` | 定义权限常量、权限类型枚举 `PermissionType`、管理员默认操作权限清单 |
+| **Auth 模块** | 修改 | `src/auth/auth-user.interface.ts` | `AuthUser` 接口增加 `permissions: string[]` 字段 |
+| **Auth 模块** | 新增 | `src/auth/decorators/require-permission.decorator.ts` | 声明式权限装饰器 `@RequirePermission(...perms)` |
+| **Auth 模块** | 新增 | `src/auth/permissions.guard.ts` | 细粒度权限校验守卫（优先级在 JWT 守卫之后） |
+| **Auth 模块** | 修改 | `src/auth/auth.module.ts` | 注册 `PermissionsGuard` 为全局 `APP_GUARD` |
+| **User 模块** | 新增 | `src/user/entities/permission.entity.ts` | 权限实体映射 (`kh_permission`) |
+| **User 模块** | 新增 | `src/user/entities/role-permission.entity.ts` | 角色-权限关联实体 (`kh_role_permission`) |
+| **User 模块** | 新增 | `src/user/entities/user-permission.entity.ts` | 用户-权限关联实体 (`kh_user_permission`) |
+| **User 模块** | 新增 | `src/user/dto/permission.dto.ts` | 权限 CRUD、分页查询、角色/用户分配权限入参 DTO |
+| **User 模块** | 新增 | `src/user/permission.service.ts` | 权限树组装、权限分配逻辑、用户多源权限聚合算法 |
+| **User 模块** | 新增 | `src/user/permission.controller.ts` | 暴露 `/permissions` 路由（CRUD、树形接口、分页） |
+| **User 模块** | 修改 | `src/user/user.service.ts` | 注入 `PermissionService`，生成 `AuthUser` 时聚合角色权限与直接权限 |
+| **User 模块** | 修改 | `src/user/user.controller.ts` | 增加用户直接权限查询与分配端点 |
+| **User 模块** | 修改 | `src/user/role.controller.ts` | 增加角色权限查询与分配端点 |
+| **User 模块** | 修改 | `src/user/user.module.ts` | 注册 3 个新 Entity、Service 与 Controller，并导出 `PermissionService` |
+| **Team 模块** | 新建目录 | `src/team/entities/team.entity.ts` | 团队实体映射 (`kh_team`) |
+| **Team 模块** | 新建 | `src/team/entities/team-member.entity.ts` | 团队成员实体 (`kh_team_member`) |
+| **Team 模块** | 新建 | `src/team/dto/team.dto.ts` | 团队 CRUD、成员增删 DTO |
+| **Team 模块** | 新建 | `src/team/team.service.ts` | 团队树构造、团队管理及成员管理业务逻辑 |
+| **Team 模块** | 新建 | `src/team/team.controller.ts` | 暴露 `/teams` 路由端点 |
+| **Team 模块** | 新建 | `src/team/team.module.ts` | 封装 Team 模块 |
+| **主模块** | 修改 | `src/app.module.ts` | 注册 Team 实体并在 `imports` 中引入 `TeamModule` |
+| **文档** | 新增 | `curl-rbac.md` | RBAC 细粒度权限及团队模块的完整 curl 测试指令集合 |
+
+---
+
+### 9.3 核心设计实现细节
+
+#### 1. 权限树与多源权限聚合逻辑
+用户拥有的最终权限编码列表 = **所属所有角色的权限集合 ∪ 用户被直接赋予的特殊权限集合**：
+```ts
+// src/user/permission.service.ts 核心算法
+async getUserPermissionCodes(userId: string): Promise<string[]> {
+  // 1. 查询用户直接分配的权限
+  const directPerms = await this.userPermRepo.find({ where: { userId } });
+  
+  // 2. 查询用户所属角色分配的权限
+  const userRoles = await this.userRoleRepo.find({ where: { userId } });
+  const roleIds = userRoles.map(r => r.roleId);
+  const rolePerms = roleIds.length > 0 
+    ? await this.rolePermRepo.find({ where: { roleId: In(roleIds) } }) 
+    : [];
+
+  // 3. 去重合并权限 ID，并批量拉取启用状态的 permission_code
+  const allPermIds = Array.from(new Set([...directPerms.map(p => p.permissionId), ...rolePerms.map(p => p.permissionId)]));
+  if (!allPermIds.length) return [];
+
+  const entities = await this.permRepo.find({
+    where: { id: In(allPermIds), status: 1, deleted: false },
+    select: [permissionCode],
+  });
+  return entities.map(e => e.permissionCode);
+}
+```
+
+#### 2. PermissionsGuard 声明式守卫
+在每个需要细粒度权限保护的 Controller 方法上添加 `@RequirePermission(system:user)`：
+- 若用户包含 `ROLE_ADMIN` 角色，守卫自动放行（超级管理员具备全局通配特权）。
+- 否则检查 `request.user.permissions` 是否包含该方法所需的任意一个权限码。
+- 未命中的直接抛出 `ForbiddenException(权限不足)`。
