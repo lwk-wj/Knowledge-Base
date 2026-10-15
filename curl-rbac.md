@@ -75,7 +75,7 @@ curl -s "$BASE/roles/2000000000000000002/permissions" \
 curl -s -X PUT "$BASE/roles/2000000000000000002/permissions" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"permissionIds": ["4000000000000000011", "4000000000000000015"]}' | jq
+  -d '{"permissionIds": ["4000000000000000011", "4000000000000000015","369011218179952640"]}' | jq
 ```
 
 ---
@@ -89,7 +89,7 @@ curl -s "$BASE/users/1000000000000000003/permissions" \
 curl -s -X PUT "$BASE/users/1000000000000000003/permissions" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"permissionIds": ["4000000000000000012"]}' | jq
+  -d '{"permissionIds": ["369011218179952640"]}' | jq
 ```
 
 ---
