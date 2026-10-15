@@ -8,11 +8,11 @@ import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { EmailService } from './email.service';
 import { EmailActivationService } from './email-activation.service';
-import { RegisterCodeService } from './register-code.service';
 import { PasswordResetService } from './password-reset.service';
 import { JwtStrategy } from './jwt.strategy';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { RolesGuard } from './roles.guard';
+import { PermissionsGuard } from './permissions.guard';
 import { UserModule } from '../user/user.module';
 
 @Module({
@@ -33,7 +33,6 @@ import { UserModule } from '../user/user.module';
     AuthService,
     EmailService,
     EmailActivationService,
-    RegisterCodeService,
     PasswordResetService,
     JwtStrategy,
     {
@@ -43,6 +42,10 @@ import { UserModule } from '../user/user.module';
     {
       provide: APP_GUARD,
       useClass: RolesGuard,
+    },
+    {
+      provide: APP_GUARD,
+      useClass: PermissionsGuard,
     },
   ],
   exports: [AuthService, UserModule],
