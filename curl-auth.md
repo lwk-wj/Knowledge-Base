@@ -23,7 +23,7 @@ export BASE=http://localhost:3000
 ```bash
 curl -s -X POST "$BASE/auth/login" \
   -H 'Content-Type: application/json' \
-  -d '{"username":"user","password":"123456"}' | jq
+  -d '{"username":"wanger","password":"654321"}' | jq
 ```
 
 ```bash
@@ -61,7 +61,7 @@ curl -s -X POST "$BASE/auth/register" \
   -d '{
     "username": "zhangsan",
     "password": "123456",
-    "email": "lingxiao_guang@foxmail.com",
+    "email": "1364848261@qq.com",
     "realName": "张三"
   }' | jq
 ```
@@ -90,12 +90,12 @@ curl -s "$BASE/auth/verify-email?token=$ACTIVATION_TOKEN" | jq
 # 1. 发送验证码
 curl -s -X POST "$BASE/auth/password/reset/send-code" \
   -H 'Content-Type: application/json' \
-  -d '{"email":"lingxiao_guang@foxmail.com"}' | jq
+  -d '{"email":"1364848261@qq.com"}' | jq
 
 # 2. 重置密码（邮箱 + 验证码 + 新密码）
 curl -s -X POST "$BASE/auth/password/reset" \
   -H 'Content-Type: application/json' \
-  -d '{"email":"lingxiao_guang@foxmail.com","code":"123456","newPassword":"654321"}' | jq
+  -d '{"email":"1364848261@qq.com","code":"749895","newPassword":"654321"}' | jq
 ```
 
 ---
