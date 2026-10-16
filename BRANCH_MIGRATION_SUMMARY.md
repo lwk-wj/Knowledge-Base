@@ -613,3 +613,49 @@ async getUserPermissionCodes(userId: string): Promise<string[]> {
 - 若用户包含 `ROLE_ADMIN` 角色，守卫自动放行（超级管理员具备全局通配特权）。
 - 否则检查 `request.user.permissions` 是否包含该方法所需的任意一个权限码。
 - 未命中的直接抛出 `ForbiddenException(权限不足)`。
+
+---
+
+## 10. v9 -> v10 分支升级改造指南（全文检索与知识图谱服务化、异步管线全量索引与操作人审计）
+
+### 10.1 改造背景与核心目标
+在 v9 阶段，系统具备了 RBAC 细粒度权限控制与组织架构，但存在以下痛点：
+1. **ES 搜索与 Neo4j 图谱未服务化**：写入了数据却没有对外的查询/检索 API，前端无法使用搜索和图谱可视化。
+2. **MQ 索引消息过大与正文截断**：之前发布文档时将正文前 1000 字塞进 MQ 消息中，既导致 MQ 消息体庞大，又导致长文章全文无法被完整检索。
+3. **审计漏洞**：之前接口允许前端自行传入 `authorId`、`createBy` 等，容易造成越权冒用。
+
+**v10 的核心目标**：
+1. **全新暴露 `SearchModule`**：提供 `POST /search` 接口，基于 Elasticsearch IK 中文分词（写入 `ik_max_word`，检索 `ik_smart`）与多字段加权匹配（`title^3`, `summary^2`, `content`），支持关键词搜索与 `<em>` 高亮片段。
+2. **全新暴露 `GraphModule`**：提供 `GET /graph/search`、`GET /graph/nodes`、`GET /graph/edges` 接口，支持 Neo4j 实体、文档、切片节点查询与跨文档关联网络查询。
+3. **异步管线与 MQ 消息瘦身重构**：MQ 消息仅投递 `documentId`，由消费者异步从 Postgres + Mongo 读取完整正文入库 ES，实现“零截断全量索引 + MQ 轻量化”。
+4. **安全与操作人审计强化**：DTO 移除前端传入的 `authorId` / `createBy`，统一从 JWT 登录态自动获取并记录 `updateBy`，结合 `@RequirePermission()` 实施细粒度权限校验。
+
+---
+
+### 10.2 涉及变动的文件清单总览
+
+| 模块分类 | 变更类型 | 文件路径 | 核心职责 |
+| :--- | :---: | :--- | :--- |
+| **常量与 SQL** | 修改 | `src/common/constants/permissions.ts` | 新增 `PermissionCode` 常量字典（包含 `search` 权限码） |
+| | 修改 | `init-scripts/postgresql/init.sql` | 为普通用户与审核员角色追加搜索及文档编辑权限 |
+| **检索模块** | 新建 | `src/search/dto/search.dto.ts` | 全文搜索请求 DTO（关键词、分页、分类/作者过滤） |
+| | 新建 | `src/search/search.controller.ts` | 暴露 `POST /search` 端点，受 `@RequirePermission(PermissionCode.search)` 保护 |
+| | 新建 | `src/search/search.module.ts` | 封装检索模块，引入 `PipelineModule` |
+| **图谱模块** | 新建 | `src/graph/dto/graph-query.dto.ts` | 图谱节点、边与关键字搜索请求 DTO |
+| | 新建 | `src/graph/graph.controller.ts` | 暴露 `GET /graph/search`、`/nodes`、`/edges` 端点 |
+| | 新建 | `src/graph/graph.module.ts` | 封装图谱模块，引入 `PipelineModule` |
+| **管线引擎** | 修改 | `src/pipeline/search-index.service.ts` | 实现 `searchDocuments` 高亮多字段打分检索算法，配置 IK 中文分析器 |
+| | 修改 | `src/pipeline/graph-build.service.ts` | 实现 `listNodes`、`listEdges`、`searchGraph` 查询 Neo4j 知识实体与关联关系 |
+| | 修改 | `src/pipeline/pipeline.orchestrator.ts` | 消费端重构为根据 `documentId` 自动聚合 Postgres 元数据与 Mongo 正文 |
+| | 修改 | `src/pipeline/pipeline.module.ts` | 导出 `EmbeddingService` 供外部可能调用 |
+| **MQ 异步消息** | 修改 | `src/mq/messages/pipeline.messages.ts` | `SearchIndexMessage` 结构精简，移除直接内嵌的 `document` 快照 |
+| | 修改 | `src/mq/document-pipeline.publisher.ts` | `triggerSearchIndex` 仅投递 `documentId`，移除 1000 字正文截断限制 |
+| | 修改 | `src/mq/document-pipeline.consumer.ts` | 调整参数调用消费逻辑 |
+| **文档模块** | 修改 | `src/document/dto/create-document.dto.ts` | 移除前端传入的 `authorId`, `createBy` |
+| | 修改 | `src/document/dto/update-document.dto.ts` | 移除前端传入的 `updateBy` |
+| | 修改 | `src/document/dto/upload-parse.dto.ts` | 移除解析表单传入的作者与创建人字段 |
+| | 修改 | `src/document/document.service.ts` | 方法入参传入 `actor: AuthUser`，发布/删除/更新自动审计操作人，移除正文冗余传参 |
+| | 修改 | `src/document/document-review.service.ts` | 审核流记录操作人员 ID |
+| | 修改 | `src/document/document.controller.ts` | 端点补充 `@RequirePermission()` 细粒度权限控制，从当前用户注入 `actor` |
+| **全局主模块** | 修改 | `src/app.module.ts` | 注册引入 `SearchModule` 与 `GraphModule` |
+| **测试文档** | 新建 | `curl-read.md` | 全流程：上传 PDF -> 审核发布 -> MQ 异步入库 -> ES 全文搜索与 Neo4j 图谱检索 |
