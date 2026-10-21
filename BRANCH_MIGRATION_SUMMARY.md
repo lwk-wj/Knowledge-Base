@@ -659,3 +659,49 @@ async getUserPermissionCodes(userId: string): Promise<string[]> {
 | | 修改 | `src/document/document.controller.ts` | 端点补充 `@RequirePermission()` 细粒度权限控制，从当前用户注入 `actor` |
 | **全局主模块** | 修改 | `src/app.module.ts` | 注册引入 `SearchModule` 与 `GraphModule` |
 | **测试文档** | 新建 | `curl-read.md` | 全流程：上传 PDF -> 审核发布 -> MQ 异步入库 -> ES 全文搜索与 Neo4j 图谱检索 |
+
+---
+
+## 11. v10 -> v11 分支升级改造指南（企业级 Hybrid RAG 混合检索、文本重排 Reranker 与智能问答 Chat）
+
+### 11.1 改造背景与核心目标
+在 v10 阶段，系统具备了基于 ES 的“整篇文档全文搜索”与基于 Neo4j 的“图谱检索”，但**尚未形成面向知识问答的端到端 RAG 闭环**：
+1. **单一检索召回率低**：仅靠向量检索（Dense）容易漏掉精确的专有名词、错误码、工单号；仅靠关键词检索（Sparse）无法理解同义词和语义关联。
+2. **缺乏二次精排**：粗排检索出的块分数不在同一尺度，直接塞给 LLM 容易造成“迷失在中间（Lost in the middle）”和幻觉。
+3. **缺乏智能回答与精准引用溯源**：前端需要问答结果，同时必须知道回答每一句话引自哪个文档的哪个段落。
+
+**v11 的核心目标**：
+1. **实现 Dual-Channel 混合检索（Hybrid Search）**：
+   - 稠密检索：`knnSearch` 基于 `kh_chunk` 索引的 `dense_vector`（1024 维）做余弦相似度（Cosine）召回。
+   - 稀疏检索：`keywordSearch` 基于 `kh_chunk` 的正文与标题做 BM25 词法召回（IK 中文分词）。
+   - 粗排融合：基于 **RRF（Reciprocal Rank Fusion 倒数排名融合算法）** 无量纲融合双路排名，得出最优候选集。
+2. **集成 Cross-Encoder 文本重排（RerankerService）**：
+   - 接入工业界主流的文本重排服务（如 DashScope `qwen3-rerank`），对 RRF 候选块打出绝对相关度评分（0~1）。
+   - 内置平滑降级：在未配置 API Key 或网络波动时，自动回退到 RRF 得分排序，保证高可用。
+3. **RAG 智能对话与可信引用（AiChatService）**：
+   - 组装知识上下文，注入 Prompt 约束大模型“仅依据提供的材料回答，不知则言不知”；
+   - 自动在回答句子结尾标注资料编号（如 `[1]`, `[2]`）；
+   - 正则自动抽取引用标记，过滤出真实被参考的段落切片作为溯源信息返回。
+
+---
+
+### 11.2 涉及变动的文件清单总览
+
+| 模块分类 | 变更类型 | 文件路径 | 核心职责 |
+| :--- | :---: | :--- | :--- |
+| **管道层类型** | 修改 | `src/pipeline/types/pipeline.types.ts` | 新增 `ChunkHit` 检索命中结果接口 |
+| **向量检索服务** | 修改 | `src/pipeline/vector-index.service.ts` | 实现 `keywordSearch`、`knnSearch`、`searchHybrid`、`rrfFuse`；`kh_chunk` 启用 IK 分词 |
+| **文档检索服务** | 修改 | `src/pipeline/search-index.service.ts` | 索引初始化逻辑微调 |
+| **AI 模块 DTO** | 新建 | `src/ai/dto/chat.dto.ts` | RAG 问答请求入参（`content`, `topK`） |
+| | 新建 | `src/ai/dto/rag-search.dto.ts` | 仅混合检索不问答请求入参（`query`, `topK`） |
+| **AI 重排服务** | 新建 | `src/ai/reranker.service.ts` | 接入 `qwen3-rerank` 文本重排，支持多 Key 兼容与自动降级 |
+| **AI 检索服务** | 新建 | `src/ai/hybrid-retrieval.service.ts` | 编排查询向量化、ES 双路混合召回、RRF 融合与重排切片 |
+| **AI 问答服务** | 新建 | `src/ai/ai-chat.service.ts` | 知识上下文拼装、LangChain 提示词驱动、回答生成与引用溯源提取 |
+| **AI 控制器** | 新建 | `src/ai/ai.controller.ts` | 暴露 `POST /rag/search` 与 `POST /ai/chat` 端点 |
+| **AI 模块封装** | 新建 | `src/ai/ai.module.ts` | 组装 AI 模块依赖，引入 `PipelineModule` |
+| **全局主模块** | 修改 | `src/app.module.ts` | 引入并注册 `AiModule` |
+| **测试测试集** | 新建 | `test-files/rag-canary.json` | 灰度发布测试文档 |
+| | 新建 | `test-files/rag-onboarding.json` | 入职指南测试文档 |
+| | 新建 | `test-files/rag-incident.json` | 故障应急测试文档 |
+| | 新建 | `test-files/rag-visibility.json` | 知识库可见性测试文档 |
+| **测试文档** | 新建 | `curl-rag.md` | 多文档批量发布、RAG 混合检索验证、智能问答测试文档 |
