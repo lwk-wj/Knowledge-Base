@@ -705,3 +705,35 @@ async getUserPermissionCodes(userId: string): Promise<string[]> {
 | | 新建 | `test-files/rag-incident.json` | 故障应急测试文档 |
 | | 新建 | `test-files/rag-visibility.json` | 知识库可见性测试文档 |
 | **测试文档** | 新建 | `curl-rag.md` | 多文档批量发布、RAG 混合检索验证、智能问答测试文档 |
+
+---
+
+## 十二、从 v11 到 v12：知识图谱全景分析与前端大屏可视化（Graph Overview & CORS）
+
+### 12.1 架构演进与核心目标
+在 v11 完成了 RAG 混合检索与引用溯源问答之后，v12 聚焦于**知识图谱全景检索、多维统计聚合与前端力导向图可视化大屏支撑**：
+1. **全局启用 CORS 跨域支持**：
+   - 在应用入口 `src/main.ts` 中配置 `app.enableCors({ origin: true, credentials: true })`，打通前端知识图谱大屏与前端独立站点的跨域调用。
+2. **文档标签与图谱双向联动**：
+   - 在文档图谱构建阶段（`buildDocumentGraph`），将 `KnowledgeDocument` 节点的 `tags` 属性同步写入 Neo4j，支持后续基于多标签切分、聚类与关联。
+3. **高性能全景图检索与多维聚合（getOverview）**：
+   - **多条件联合过滤**：支持关键词匹配（文档标题/摘要/标签/实体名称/描述）、实体类型过滤（`entityType`）、时间范围限定（`from` ~ `to`）和文档拉取条数控制（`docLimit`，默认 24，最大 80）。
+   - **全库宏观统计（stats）**：分段 `OPTIONAL MATCH ... WITH` 计算文档数、实体数、RELATED_TO 关联边数、MENTIONS 提及关系数，并聚合各实体类型的分布占比。
+   - **Top 核心实体与最近更新看板**：
+     - 计算被提及次数（度数 degree）最高的 Top 5 核心实体；
+     - 检索最新更新的 8 篇文档节点作为最近动态。
+   - **三元组与实体关联局部诱导子图构建**：
+     - 构造三类画布节点：`document`（文档节点）、`entity`（实体节点）、`tag`（标签节点）；
+     - 构造三类边：`mentions`（文档提及实体）、`tagged`（文档标注标签）、`related`（仅查询画布上实体之间的 `RELATED_TO` 边，上限 400，避免拉取全库边导致前端力导向图崩溃）。
+
+---
+
+### 12.2 涉及变动的文件清单总览
+
+| 模块分类 | 变更类型 | 文件路径 | 核心职责 |
+| :--- | :---: | :--- | :--- |
+| **全局入口** | 修改 | `src/main.ts` | 开启 `app.enableCors` 跨域支持 |
+| **图谱模块 DTO** | 修改 | `src/graph/dto/graph-query.dto.ts` | 新增 `GraphOverviewDto` 查询参数类 |
+| **图谱控制器** | 修改 | `src/graph/graph.controller.ts` | 新增 `GET /graph/overview` 全景接口 |
+| **图谱构建服务** | 修改 | `src/pipeline/graph-build.service.ts` | 节点增加 `tags` 写入，实现 `getOverview` 全景多维检索与统计方法 |
+
