@@ -737,3 +737,39 @@ async getUserPermissionCodes(userId: string): Promise<string[]> {
 | **图谱控制器** | 修改 | `src/graph/graph.controller.ts` | 新增 `GET /graph/overview` 全景接口 |
 | **图谱构建服务** | 修改 | `src/pipeline/graph-build.service.ts` | 节点增加 `tags` 写入，实现 `getOverview` 全景多维检索与统计方法 |
 
+
+---
+
+## 十三、从 v12 到 v13：RAG 智能对话会话历史管理与持久化（Session & Message Persistence）
+
+### 13.1 架构演进与核心目标
+在 v12 支持知识图谱全景可视化的基础上，v13 针对企业知识库智能问答场景，实现了**对话会话持久化、多轮历史回溯与用户专属会话管理**：
+1. **关系型数据库结构扩展（PostgreSQL + TypeORM）**：
+   - 新增 `kh_ai_session`（会话表）：记录会话 ID、用户 ID、会话标题、创建与更新时间，建有 `(user_id, updated_at DESC)` 联合索引支撑高效分页；
+   - 新增 `kh_ai_message`（消息表）：关联 `session_id`（外键级联删除），记录 `role`（user/assistant）、`content`、`sources`（JSONB 存储引用溯源列表）与创建时间。
+2. **自动化开会话与智能标题提取（appendTurn）**：
+   - 用户发送问题时若未传入 `sessionId`，后端自动生成雪花 ID 新建会话；
+   - 首问自动截取问题前 30 个字符作为会话标题，无需用户繁琐手动起名；
+   - 每次对话更新 `session.updatedAt`，保证前端会话侧边栏按最近活跃时间排序。
+3. **完整的会话生命周期 API**：
+   - 提供会话分页列表、新建空白会话、会话重命名、删除会话（级联清除消息）、获取会话全量消息流等完整 CRUD 接口；
+   - 数据层面通过 `@CurrentUser()` 强校验 `userId`，会话隔离安全可靠。
+
+---
+
+### 13.2 涉及变动的文件清单总览
+
+| 模块分类 | 变更类型 | 文件路径 | 核心职责 |
+| :--- | :---: | :--- | :--- |
+| **数据库 DDL** | 修改 | `init-scripts/postgresql/init.sql` | 增加 `kh_ai_session` 与 `kh_ai_message` 建表及索引语句 |
+| **类型定义** | 新建 | `src/ai/chat.types.ts` | 抽取 `ChatSource` 引用溯源条目通用接口 |
+| **持久化实体** | 新建 | `src/ai/entities/ai-session.entity.ts` | TypeORM 映射 `kh_ai_session` 实体 |
+| | 新建 | `src/ai/entities/ai-message.entity.ts` | TypeORM 映射 `kh_ai_message` 实体，含 JSONB sources |
+| **数据传输对象** | 修改 | `src/ai/dto/chat.dto.ts` | `ChatDto` 扩展可选字段 `sessionId?: string` |
+| | 新建 | `src/ai/dto/session.dto.ts` | 新增 `QuerySessionDto`、`CreateSessionDto`、`UpdateSessionDto` |
+| **全局主模块** | 修改 | `src/app.module.ts` | 在 `TypeOrmModule` 中注册两个 AI 实体 |
+| **会话管理服务** | 新建 | `src/ai/chat-session.service.ts` | 实现会话列表、创建、重命名、删除、消息查看与自动落库 |
+| **AI 对话服务** | 修改 | `src/ai/ai-chat.service.ts` | 对接 `ChatSessionService`，支持关联用户与会话落库，返回 `sessionId` |
+| **AI 控制器** | 修改 | `src/ai/ai.controller.ts` | `POST /ai/chat` 注入当前用户；增加会话 CRUD 系列端点 |
+| **AI 模块封装** | 修改 | `src/ai/ai.module.ts` | 声明并注入 `ChatSessionService` 提供者 |
+
